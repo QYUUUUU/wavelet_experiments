@@ -1,306 +1,341 @@
+# ==============================================================================
+# IMPORTS ET CONFIGURATION
+# ==============================================================================
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import ptwt
-import pywt
-import os
-from pathlib import Path
-from datasets import load_dataset
-from transformers import AutoTokenizer, DataCollatorWithPadding
+import torch.optim as optim
 from torch.utils.data import DataLoader
-from dotenv import load_dotenv
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModel
+from sklearn.metrics import accuracy_score, f1_score
+from tqdm.auto import tqdm
+import numpy as np
+import pywt
+import ptwt
+import logging
+import datetime
+import os
 
-load_dotenv(Path(__file__).with_name(".env.local"))
-hf_token = os.getenv("HF_TOKEN")
+# Configuration du Logging
+log_filename = f"wlm_sst2_run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_filename,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-if not hf_token:
-    raise ValueError("HF_TOKEN not found in .env.local")
+# Configuration du device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[*] Exécution sur le device : {device}")
+logging.info(f"Démarrage de l'expérience. Device: {device}")
 
-print("[1/7] HF token loaded from .env.local", flush=True)
+# ==============================================================================
+# 1. ARCHITECTURE WLM (Composants Fondamentaux)
+# ==============================================================================
 
+class TokenToVolumetric(nn.Module):
+    """
+    Sliding window et Channel Expansion.
+    Extrait le signal maximal en ignorant le Padding.
+    """
+    def __init__(self, embed_dim=768, C=1, D=8, H=8, W=8, window_size=3):
+        super().__init__()
+        self.C, self.D, self.H, self.W = C, D, H, W
+        
+        # Projection très légère (768 -> 512 dimensions)
+        self.sliding_window = nn.Conv1d(
+            in_channels=embed_dim, 
+            out_channels=C * D * H * W, # 1 * 8 * 8 * 8 = 512
+            kernel_size=window_size, 
+            padding=window_size // 2
+        )
+        
+    def forward(self, x):
+        x = x.permute(0, 2, 1) # (B, E, L)
+        x_windowed = self.sliding_window(x) # -> (B, 512, L)
+        
+        # Le Max Pooling sauve le modèle : il extrait les mots et ignore le [PAD]
+        x_vol = F.adaptive_max_pool1d(x_windowed, 1).squeeze(-1)
+        
+        return x_vol.view(x.size(0), self.C, self.D, self.H, self.W)
 
-class SpectralNonlinearity(nn.Module):
+class BandwiseInteraction(nn.Module):
+    """
+    Simule des portes logiques (AND) entre les sous-bandes directionnelles des ondelettes[cite: 378, 385].
+    """
+    def __init__(self):
+        super().__init__()
+        self.gamma_r = nn.Parameter(torch.tensor(1.0))
+        self.lambda_r = nn.Parameter(torch.tensor(0.01))
+
+    def forward(self, cD_dict):
+        keys = list(cD_dict.keys())
+        if len(keys) >= 2:
+            k1, k2 = keys[0], keys[1]
+            interaction = self.gamma_r * F.relu(cD_dict[k1] * cD_dict[k2] - self.lambda_r)
+            cD_dict[k1] = cD_dict[k1] + interaction
+            cD_dict[k2] = cD_dict[k2] + interaction
+        return cD_dict
+
+class SpectralNonLinearity(nn.Module):
+    """
+    Applique la non-linéarité spectrale avec seuillage doux et modulation de phase[cite: 32, 146].
+    Formule : \phi(z) = \gamma * sign(z) * max(|z| - \lambda, 0) * cos(\theta)[cite: 146].
+    """
     def __init__(self, channels):
         super().__init__()
-        self.lambda_approx = nn.Parameter(torch.full((1, channels, 1), 0.05))
-        self.lambda_detail = nn.Parameter(torch.full((1, channels, 1), 0.05))
-        self.log_gamma = nn.Parameter(torch.zeros((1, channels, 1)))
-        self.theta = nn.Parameter(torch.zeros((1, channels, 1)))
+        self.lambda_A = nn.Parameter(torch.full((1, channels, 1, 1, 1), 0.05))
+        self.lambda_D = nn.Parameter(torch.full((1, channels, 1, 1, 1), 0.05))
+        self.gamma = nn.Parameter(torch.ones(1, channels, 1, 1, 1))
+        self.theta = nn.Parameter(torch.zeros(1, channels, 1, 1, 1))
 
-    def _transform(self, z, lam):
-        gamma = F.softplus(self.log_gamma) + 1e-6
-        return gamma * torch.sign(z) * torch.relu(torch.abs(z) - lam) * torch.cos(self.theta)
+    def _phi(self, z, lambd):
+        soft_threshold = F.relu(torch.abs(z) - lambd)
+        return self.gamma * torch.sign(z) * soft_threshold * torch.cos(self.theta)
 
-    def forward_approx(self, z):
-        return self._transform(z, self.lambda_approx)
+    def forward(self, cA, cD):
+        cA_out = self._phi(cA, self.lambda_A)
+        cD_out = {k: self._phi(v, self.lambda_D) for k, v in cD.items()}
+        return cA_out, cD_out
 
-    def forward_detail(self, z):
-        return self._transform(z, self.lambda_detail)
-
-
-class WLMLayer(nn.Module):
-    def __init__(
-        self,
-        embed_dim,
-        wavelets=None,
-        dilation_interval=2,
-        max_dilation=2,
-        pruning_threshold=0.02,
-        ema_momentum=0.9,
-    ):
+class SoftBasisSelectorLayer(nn.Module):
+    def __init__(self, channels, D, H, W, candidates=['haar', 'db4', 'sym6', 'bior1.3']):
         super().__init__()
-        self.wavelets = wavelets or ["haar", "db4", "sym6", "bior1.3"]
-        self.spectral = SpectralNonlinearity(embed_dim)
-        self.basis_logits = nn.Parameter(torch.zeros(len(self.wavelets)))
-        self.register_buffer("active_mask", torch.ones(len(self.wavelets), dtype=torch.bool))
-        self.register_buffer("ema_basis_weights", torch.zeros(len(self.wavelets)))
-        self.dilation_interval = dilation_interval
-        self.max_dilation = max_dilation
-        self.pruning_threshold = pruning_threshold
-        self.ema_momentum = ema_momentum
-        self.current_level = 1
-        self._valid_cache = {}
-        self._last_full_weights = None
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def set_epoch(self, epoch_idx):
-        dilation = min(epoch_idx // self.dilation_interval, self.max_dilation)
-        self.current_level = 1 + dilation
-
-    def _get_valid_indices(self, x):
-        seq_len = x.shape[-1]
-        cache_key = (seq_len, self.current_level)
-        if cache_key in self._valid_cache:
-            return self._valid_cache[cache_key]
-
-        valid = []
-        dummy = x[:1, :1, :]
-        for idx, wavelet in enumerate(self.wavelets):
-            if not self.active_mask[idx]:
-                continue
-            try:
-                coeffs = ptwt.wavedec(dummy, wavelet, level=self.current_level)
-                recon = ptwt.waverec(coeffs, wavelet)
-                if recon.shape[-1] >= seq_len:
-                    valid.append(idx)
-            except Exception:
-                continue
-
-        if not valid:
-            valid = [0]
-            self.active_mask[0] = True
-
-        self._valid_cache[cache_key] = valid
-        return valid
-
-    def maybe_prune(self):
-        with torch.no_grad():
-            candidates = torch.where(self.active_mask)[0]
-            if len(candidates) <= 1:
-                return
-            to_prune = (self.ema_basis_weights < self.pruning_threshold) & self.active_mask
-            if to_prune.any():
-                best_idx = int(torch.argmax(self.ema_basis_weights).item())
-                to_prune[best_idx] = False
-                self.active_mask[to_prune] = False
-                self._valid_cache.clear()
-
-    def entropy_penalty(self):
-        mask = self.active_mask
-        logits = self.basis_logits[mask]
-        weights = torch.softmax(logits, dim=0)
-        return -(weights * (weights + 1e-8).log()).sum()
-
-    def forward(self, x):
-        residual = x
-        x = x.transpose(1, 2)
-
-        valid_indices = self._get_valid_indices(x)
-        logits = self.basis_logits[valid_indices]
-        weights = torch.softmax(logits, dim=0)
-        recon_candidates = []
-
-        for local_idx, basis_idx in enumerate(valid_indices):
-            wavelet = self.wavelets[basis_idx]
-            coeffs = ptwt.wavedec(x, wavelet, level=self.current_level)
-            processed = [self.spectral.forward_approx(coeffs[0])]
-            processed.extend(self.spectral.forward_detail(c) for c in coeffs[1:])
-            rec = ptwt.waverec(processed, wavelet)
-            rec = rec[:, :, :residual.shape[1]]
-            recon_candidates.append(weights[local_idx] * rec)
-
-        x = torch.stack(recon_candidates, dim=0).sum(dim=0)
-
-        with torch.no_grad():
-            full_weights = torch.zeros_like(self.basis_logits)
-            full_weights[valid_indices] = weights.detach()
-            self._last_full_weights = full_weights
-            self.ema_basis_weights.mul_(self.ema_momentum).add_((1 - self.ema_momentum) * full_weights)
-
-        x = x.transpose(1, 2)
-        return self.norm(x + residual)
-
-class WLMClassifier(nn.Module):
-    def __init__(self, vocab_size, embed_dim=128, num_layers=4, pad_token_id=0):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_token_id)
-        self.layers = nn.ModuleList([WLMLayer(embed_dim) for _ in range(num_layers)])
-        self.classifier = nn.Linear(embed_dim, 2)
-
-    def set_epoch(self, epoch_idx):
-        for layer in self.layers:
-            layer.set_epoch(epoch_idx)
-
-    def prune_wavelets(self):
-        for layer in self.layers:
-            layer.maybe_prune()
-
-    def entropy_penalty(self):
-        return torch.stack([layer.entropy_penalty() for layer in self.layers]).mean()
-
-    def active_wavelets_summary(self):
-        summaries = []
-        for i, layer in enumerate(self.layers, start=1):
-            active = [w for w, m in zip(layer.wavelets, layer.active_mask.tolist()) if m]
-            summaries.append(f"L{i}:{'/'.join(active)}")
-        return " | ".join(summaries)
+        self.valid_candidates = []
+        self.reasoning = BandwiseInteraction()
         
-    def forward(self, input_ids, attention_mask=None):
-        x = self.embedding(input_ids)
+        dummy_tensor = torch.randn(1, channels, D, H, W)
+        
+        for wav_name in candidates:
+            try:
+                wavelet = pywt.Wavelet(wav_name)
+                coeffs = ptwt.wavedec3(dummy_tensor, wavelet, level=1, mode='reflect')
+                rec = ptwt.waverec3(coeffs, wavelet)
+                self.valid_candidates.append(wav_name)
+            except Exception:
+                pass 
+                
+        self.candidates = self.valid_candidates
+        msg = f"Couche WLM initialisée. Bases conservées pour {D}x{H}x{W} : {self.candidates}"
+        print(f"[*] {msg}")
+        logging.info(msg)
+        
+        if len(self.candidates) == 0:
+            raise ValueError(f"Aucune ondelette n'est compatible avec la taille {D}x{H}x{W}.")
+
+        self.basis_logits = nn.Parameter(torch.randn(len(self.candidates)) * 0.1)
+        self.spectral_nl = SpectralNonLinearity(channels)
+        
+    def _real_dwt3d(self, x, wavelet_name):
+        wavelet = pywt.Wavelet(wavelet_name)
+        coeffs = ptwt.wavedec3(x, wavelet, level=1, mode='reflect')
+        return coeffs[0], coeffs[1]
+        
+    def _real_idwt3d(self, cA, cD_dict, wavelet_name, target_shape):
+        wavelet = pywt.Wavelet(wavelet_name)
+        x_rec = ptwt.waverec3([cA, cD_dict], wavelet)
+        return x_rec[:, :, :target_shape[2], :target_shape[3], :target_shape[4]]
+
+    def forward(self, x, dilation_scale=1):
+        w = F.softmax(self.basis_logits, dim=0)
+        x_reconstructed = 0
+        
+        for i, wavelet_name in enumerate(self.candidates):
+            cA, cD_dict = self._real_dwt3d(x, wavelet_name)
+            cA_prime, cD_prime = self.spectral_nl(cA, cD_dict)
+            cD_prime = self.reasoning(cD_prime)
+            x_hat_k = self._real_idwt3d(cA_prime, cD_prime, wavelet_name, x.shape)
+            x_reconstructed = x_reconstructed + w[i] * x_hat_k
+            
+        return x_reconstructed, w
+        
+class WaveletLogicModel(nn.Module):
+    def __init__(self, embed_dim, D, H, W, num_hops=3):
+        super().__init__()
+        # On utilise C=1 canal pour garder un cube unique et peu de paramètres
+        self.pipeline = TokenToVolumetric(embed_dim, C=1, D=D, H=H, W=W)
+        self.layers = nn.ModuleList([
+            SoftBasisSelectorLayer(1, D, H, W) for _ in range(num_hops) # 1 canal spatial
+        ])
+        self.T_d = 2     
+        self.s_max = 4   
+        
+    def forward(self, x, current_epoch):
+        s_t = min(current_epoch // self.T_d, self.s_max)
+        vol = self.pipeline(x)
+        all_weights = []
+        
         for layer in self.layers:
-            x = layer(x)
+            vol, w = layer(vol, dilation_scale=s_t)
+            all_weights.append(w)
+            
+        # On aplatit le cube 8x8x8 pour le classifieur final (B, 512)
+        vol_flat = vol.view(vol.shape[0], -1)
+        return vol_flat, torch.stack(all_weights)
 
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).to(x.dtype)
-            x = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
-        else:
-            x = x.mean(dim=1)
+# ==============================================================================
+# 2. MODÈLE DE CLASSIFICATION ET FONCTION DE PERTE
+# ==============================================================================
 
-        return self.classifier(x)
+class WLMForGLUE(nn.Module):
+    def __init__(self, vocab_size, embed_dim, D, H, W, num_labels):
+        super().__init__()
+        
+        print("[*] Chargement des embeddings pré-entraînés figés (BERT)...")
+        logging.info("Chargement des embeddings pré-entraînés figés (BERT)...")
+        bert_temp = AutoModel.from_pretrained("bert-base-uncased")
+        pretrained_weights = bert_temp.embeddings.word_embeddings.weight.data
+        
+        self.embedding = nn.Embedding.from_pretrained(pretrained_weights, freeze=True)
+        embed_dim = 768 
+        del bert_temp 
+        
+        self.wlm = WaveletLogicModel(embed_dim, D, H, W, num_hops=3)
+        
+        # Le cube aplati fera 1 * 8 * 8 * 8 = 512 dimensions
+        flat_dim = 1 * D * H * W
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(flat_dim, flat_dim // 2), # 512 -> 256
+            nn.GELU(),
+            nn.Linear(flat_dim // 2, num_labels) # 256 -> 2 [cite: 232]
+        )
 
+    def forward(self, input_ids, current_epoch=0):
+        x = self.embedding(input_ids)
+        wlm_out, basis_weights = self.wlm(x, current_epoch)
+        logits = self.classifier(wlm_out)
+        return logits, basis_weights
 
+def wlm_loss_fn(logits, labels, basis_weights, beta=0.1, lambda_prune=0.5, tau=0.05):
+    """
+    Fonction de perte avec Entropy (Shannon) + Pénalité d'élagage dur (Hard Pruning)[cite: 393].
+    """
+    ce_loss = F.cross_entropy(logits, labels)
+    
+    # Correction mathématique : on SOUSTRAIT la somme (ce qui équivaut à ajouter la vraie entropie)
+    entropy_loss = - torch.sum(basis_weights * torch.log(basis_weights + 1e-9))
+    
+    # NOUVEAU : La pénalité de Hard Pruning (Élagage dur) 
+    # Si un poids passe sous le seuil tau (ex: 5%), on génère un gradient pour le tuer définitivement
+    pruning_penalty = lambda_prune * torch.sum(basis_weights * (basis_weights < tau).float())
+    
+    return ce_loss + beta * entropy_loss + pruning_penalty
 
+# ==============================================================================
+# 3. PIPELINE DE DONNÉES ET ENTRAÎNEMENT
+# ==============================================================================
 
-# 1. Setup Data
-print("[2/7] Loading tokenizer: bert-base-uncased", flush=True)
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", token=hf_token)
+def get_dataloaders(batch_size=8, max_length=512):
+    print("Préparation du dataset GLUE (SST-2)...")
+    dataset = load_dataset("glue", "sst2")
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    
+    def tokenize(batch):
+        return tokenizer(batch["sentence"], padding="max_length", truncation=True, max_length=max_length)
+    
+    encoded_dataset = dataset.map(tokenize, batched=True)
+    encoded_dataset = encoded_dataset.rename_column("label", "labels")
+    encoded_dataset.set_format(type="torch", columns=["input_ids", "labels"])
+    
+    train_dl = DataLoader(encoded_dataset["train"], batch_size=batch_size, shuffle=True)
+    eval_dl = DataLoader(encoded_dataset["validation"], batch_size=batch_size)
+    
+    return train_dl, eval_dl, tokenizer.vocab_size
 
-print("[3/7] Downloading/loading dataset: GLUE/SST-2", flush=True)
-dataset = load_dataset("glue", "sst2", token=hf_token)
+def train_and_evaluate():
+    # Hyperparamètres ajustés pour 11 Go de VRAM
+    EPOCHS = 6
+    BATCH_SIZE = 8       
+    ACCUMULATION_STEPS = 8 
+    LR = 3e-4 
+    D, H, W = 8, 8, 8 
+    
+    logging.info(f"Hyperparamètres: Epochs={EPOCHS}, Batch={BATCH_SIZE}, Accumulation={ACCUMULATION_STEPS}, LR={LR}")
+    
+    # max_length=512 pour donner l'espace nécessaire au text pooling [cite: 230]
+    train_dl, eval_dl, vocab_size = get_dataloaders(batch_size=BATCH_SIZE, max_length=512)
+    model = WLMForGLUE(vocab_size, 768, D, H, W, num_labels=2).to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    msg_params = f"Paramètres entraînables (WLM + Classifieur) : {total_params / 1e6:.2f} Millions"
+    print(f"[*] {msg_params}")
+    logging.info(msg_params)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
 
-def tokenize_fn(examples):
-    return tokenizer(examples["sentence"], truncation=True, max_length=128)
-
-print("[4/7] Tokenizing dataset (this can take a bit on first run)", flush=True)
-tokenized_ds = dataset.map(tokenize_fn, batched=True, desc="Tokenizing SST-2")
-tokenized_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
-train_loader = DataLoader(tokenized_ds["train"], batch_size=32, shuffle=True,
-                          collate_fn=DataCollatorWithPadding(tokenizer))
-val_loader = DataLoader(tokenized_ds["validation"], batch_size=64, shuffle=False,
-                        collate_fn=DataCollatorWithPadding(tokenizer))
-print(f"[5/7] Train loader: {len(train_loader)} batches | Val loader: {len(val_loader)} batches", flush=True)
-
-# 2. Initialize Model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = WLMClassifier(
-    tokenizer.vocab_size,
-    pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1)
-criterion = nn.CrossEntropyLoss()
-num_epochs = 6
-entropy_beta = 1e-3
-early_stopping_patience = 2
-best_val_loss = float("inf")
-epochs_without_improvement = 0
-
-
-@torch.no_grad()
-def evaluate(model, loader, criterion, device):
+    print("\n--- ÉVALUATION BASELINE (Pré-entraînement) ---")
     model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_count = 0
-    for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-        outputs = model(input_ids, attention_mask=attention_mask)
-        loss = criterion(outputs, labels)
-        total_loss += loss.item() * labels.size(0)
-        preds = outputs.argmax(dim=-1)
-        total_correct += (preds == labels).sum().item()
-        total_count += labels.size(0)
-    model.train()
-    return total_loss / total_count, total_correct / total_count
+    all_preds_base, all_labels_base = [], []
+    with torch.no_grad():
+        for batch in tqdm(eval_dl, desc="[Baseline]"):
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            logits, _ = model(input_ids, current_epoch=0)
+            preds = torch.argmax(logits, dim=-1)
+            all_preds_base.extend(preds.cpu().numpy())
+            all_labels_base.extend(labels.cpu().numpy())
+            
+    acc_base = accuracy_score(all_labels_base, all_preds_base)
+    print(f"Précision initiale (Aléatoire) : {acc_base:.4f}\n")
+    logging.info(f"Évaluation Baseline terminée. Précision : {acc_base:.4f}")
+    
+    print("\nDémarrage de l'entraînement WLM avec Accumulation de Gradients et Pruning...")
+    best_val_acc = 0.0
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
+        optimizer.zero_grad() 
+        
+        # Phase d'entraînement
+        for step, batch in enumerate(tqdm(train_dl, desc=f"Époque {epoch+1}/{EPOCHS} [Train]")):
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            
+            logits, weights = model(input_ids, current_epoch=epoch)
+            # Ajout de lambda_prune et tau 
+            loss = wlm_loss_fn(logits, labels, weights[-1], beta=0.1, lambda_prune=0.5, tau=0.05) / ACCUMULATION_STEPS
+            loss.backward()
+            
+            if (step + 1) % ACCUMULATION_STEPS == 0 or (step + 1) == len(train_dl):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad() 
+            
+            total_loss += loss.item() * ACCUMULATION_STEPS
+            
+        avg_train_loss = total_loss / len(train_dl)
+        
+        # Phase d'évaluation
+        model.eval()
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for batch in tqdm(eval_dl, desc=f"Époque {epoch+1}/{EPOCHS} [Eval]"):
+                input_ids = batch["input_ids"].to(device)
+                labels = batch["labels"].to(device)
+                logits, _ = model(input_ids, current_epoch=epoch)
+                preds = torch.argmax(logits, dim=-1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                
+        acc = accuracy_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds, average='macro')
+        
+        final_weights = np.round(weights[-1].detach().cpu().numpy(), 3)
+        bases_str = f"Bases {model.wlm.layers[0].candidates} : {final_weights}"
+        
+        # Sauvegarde du meilleur modèle
+        saved_msg = ""
+        if acc > best_val_acc:
+            best_val_acc = acc
+            torch.save(model.state_dict(), "best_wlm_model.pt")
+            saved_msg = " [Modèle sauvegardé ⭐]"
+        
+        log_msg = f"Époque {epoch+1} | Loss: {avg_train_loss:.4f} | Val Acc: {acc:.4f} | Val F1: {f1:.4f} | {bases_str}{saved_msg}"
+        print(f"Bilan {log_msg}")
+        logging.info(log_msg)
 
-# 3. Training Loop (Single Epoch for Demo)
-print("[6/7] Starting training", flush=True)
-model.train()
-loss = None
-for epoch in range(1, num_epochs + 1):
-    model.set_epoch(epoch - 1)
-    running_loss = 0.0
-    running_ce = 0.0
-    running_entropy = 0.0
-
-    for step, batch in enumerate(train_loader, start=1):
-        optimizer.zero_grad()
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-
-        outputs = model(input_ids, attention_mask=attention_mask)
-        ce_loss = criterion(outputs, labels)
-        entropy_penalty = model.entropy_penalty()
-        loss = ce_loss + entropy_beta * entropy_penalty
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        running_loss += loss.item()
-        running_ce += ce_loss.item()
-        running_entropy += entropy_penalty.item()
-
-        if step == 1 or step % 200 == 0:
-            print(
-                (
-                    f"Epoch {epoch}/{num_epochs} - step {step}/{len(train_loader)} "
-                    f"- total: {loss.item():.4f} - ce: {ce_loss.item():.4f} - ent: {entropy_penalty.item():.4f}"
-                ),
-                flush=True,
-            )
-
-    avg_epoch_loss = running_loss / len(train_loader)
-    avg_epoch_ce = running_ce / len(train_loader)
-    avg_epoch_entropy = running_entropy / len(train_loader)
-    val_loss, val_acc = evaluate(model, val_loader, criterion, device)
-    scheduler.step(val_loss)
-    model.prune_wavelets()
-    current_lr = optimizer.param_groups[0]["lr"]
-
-    print(
-        (
-            f"Epoch {epoch}/{num_epochs} complete - train_total: {avg_epoch_loss:.4f} "
-            f"train_ce: {avg_epoch_ce:.4f} train_ent: {avg_epoch_entropy:.4f} "
-            f"val_loss: {val_loss:.4f} val_acc: {val_acc:.4f} lr: {current_lr:.2e}"
-        ),
-        flush=True,
-    )
-    print(f"Active wavelets -> {model.active_wavelets_summary()}", flush=True)
-
-    if val_loss < best_val_loss - 1e-4:
-        best_val_loss = val_loss
-        epochs_without_improvement = 0
-    else:
-        epochs_without_improvement += 1
-        if epochs_without_improvement >= early_stopping_patience:
-            print("Early stopping triggered on validation loss.", flush=True)
-            break
-
-if loss is None:
-    raise RuntimeError("No training step was executed. Check dataset and dataloader setup.")
-
-print("[7/7] Training complete", flush=True)
-print(f"Final batch loss: {loss.item():.4f}", flush=True)
+if __name__ == "__main__":
+    train_and_evaluate()
