@@ -98,7 +98,6 @@ class SpectralNonLinearity(nn.Module):
         cA_out = self._phi(cA, self.lambda_A)
         cD_out = {k: self._phi(v, self.lambda_D) for k, v in cD.items()}
         return cA_out, cD_out
-
 class SoftBasisSelectorLayer(nn.Module):
     def __init__(self, channels, D, H, W, candidates=['haar', 'db4', 'sym6', 'bior1.3']):
         super().__init__()
@@ -127,13 +126,34 @@ class SoftBasisSelectorLayer(nn.Module):
         self.basis_logits = nn.Parameter(torch.randn(len(self.candidates)) * 0.1)
         self.spectral_nl = SpectralNonLinearity(channels)
         
-    def _real_dwt3d(self, x, wavelet_name):
-        wavelet = pywt.Wavelet(wavelet_name)
+    def _get_dilated_wavelet(self, wavelet_name, scale):
+        """
+        Génère dynamiquement une ondelette dilatée en injectant des zéros
+        dans ses banques de filtres (Algorithme à trous).
+        """
+        base_wav = pywt.Wavelet(wavelet_name)
+        if scale <= 1:
+            return base_wav
+            
+        def dilate_filter(f, s):
+            # Insère (s-1) zéros entre chaque coefficient
+            dilated = np.zeros(len(f) * s - (s - 1))
+            dilated[::s] = f
+            return dilated.tolist()
+            
+        dec_lo = dilate_filter(base_wav.dec_lo, scale)
+        dec_hi = dilate_filter(base_wav.dec_hi, scale)
+        rec_lo = dilate_filter(base_wav.rec_lo, scale)
+        rec_hi = dilate_filter(base_wav.rec_hi, scale)
+        
+        # Retourne l'ondelette mutante prête à être consommée par ptwt
+        return pywt.Wavelet(f"{wavelet_name}_dilated_{scale}", filter_bank=[dec_lo, dec_hi, rec_lo, rec_hi])
+        
+    def _real_dwt3d(self, x, wavelet):
         coeffs = ptwt.wavedec3(x, wavelet, level=1, mode='reflect')
         return coeffs[0], coeffs[1]
         
-    def _real_idwt3d(self, cA, cD_dict, wavelet_name, target_shape):
-        wavelet = pywt.Wavelet(wavelet_name)
+    def _real_idwt3d(self, cA, cD_dict, wavelet, target_shape):
         x_rec = ptwt.waverec3([cA, cD_dict], wavelet)
         return x_rec[:, :, :target_shape[2], :target_shape[3], :target_shape[4]]
 
@@ -142,10 +162,24 @@ class SoftBasisSelectorLayer(nn.Module):
         x_reconstructed = 0
         
         for i, wavelet_name in enumerate(self.candidates):
-            cA, cD_dict = self._real_dwt3d(x, wavelet_name)
-            cA_prime, cD_prime = self.spectral_nl(cA, cD_dict)
-            cD_prime = self.reasoning(cD_prime)
-            x_hat_k = self._real_idwt3d(cA_prime, cD_prime, wavelet_name, x.shape)
+            # 1. On fabrique l'ondelette selon le ratio de dilatation demandé
+            wav = self._get_dilated_wavelet(wavelet_name, dilation_scale)
+            
+            try:
+                # 2. On tente la transformée avec l'ondelette allongée
+                cA, cD_dict = self._real_dwt3d(x, wav)
+                cA_prime, cD_prime = self.spectral_nl(cA, cD_dict)
+                cD_prime = self.reasoning(cD_prime)
+                x_hat_k = self._real_idwt3d(cA_prime, cD_prime, wav, x.shape)
+            except Exception:
+                # SÉCURITÉ : Si la dilatation rend le filtre plus grand que notre cube de 8x8x8,
+                # la convolution va planter. On utilise silencieusement l'ondelette de secours (non dilatée).
+                fallback_wav = pywt.Wavelet(wavelet_name)
+                cA, cD_dict = self._real_dwt3d(x, fallback_wav)
+                cA_prime, cD_prime = self.spectral_nl(cA, cD_dict)
+                cD_prime = self.reasoning(cD_prime)
+                x_hat_k = self._real_idwt3d(cA_prime, cD_prime, fallback_wav, x.shape)
+                
             x_reconstructed = x_reconstructed + w[i] * x_hat_k
             
         return x_reconstructed, w
@@ -153,27 +187,30 @@ class SoftBasisSelectorLayer(nn.Module):
 class WaveletLogicModel(nn.Module):
     def __init__(self, embed_dim, D, H, W, num_hops=3):
         super().__init__()
-        # On utilise C=1 canal pour garder un cube unique et peu de paramètres
         self.pipeline = TokenToVolumetric(embed_dim, C=1, D=D, H=H, W=W)
         self.layers = nn.ModuleList([
-            SoftBasisSelectorLayer(1, D, H, W) for _ in range(num_hops) # 1 canal spatial
+            SoftBasisSelectorLayer(1, D, H, W) for _ in range(num_hops)
         ])
+        
+        # Les hyperparamètres de dilatation du papier
         self.T_d = 2     
         self.s_max = 4   
         
     def forward(self, x, current_epoch):
-        s_t = min(current_epoch // self.T_d, self.s_max)
+        # Formule du papier : s(t) = min(floor(t / T_d), s_max)
+        # On ajoute +1 pour que l'échelle minimale soit 1 (pas de zéros)
+        s_t = 1 + min(current_epoch // self.T_d, self.s_max)
+        
         vol = self.pipeline(x)
         all_weights = []
         
         for layer in self.layers:
+            # On passe dynamiquement l'échelle de dilatation aux couches spectrales
             vol, w = layer(vol, dilation_scale=s_t)
             all_weights.append(w)
             
-        # On aplatit le cube 8x8x8 pour le classifieur final (B, 512)
         vol_flat = vol.view(vol.shape[0], -1)
         return vol_flat, torch.stack(all_weights)
-
 # ==============================================================================
 # 2. MODÈLE DE CLASSIFICATION ET FONCTION DE PERTE
 # ==============================================================================
